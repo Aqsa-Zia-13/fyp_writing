@@ -168,46 +168,51 @@ class SubmitResponseTests(unittest.TestCase):
         response = views.submit_response(self.post({'task_number': 1, 'response': '  '}))
         self.assertEqual(json.loads(response.content)['detail'], 'Response cannot be empty.')
 
-    def test_success_response_uses_saved_evaluation_and_overall_band(self):
+    def test_bad_task_token_is_rejected_before_database_or_gemini(self):
         words = ' '.join(f'word{i}' for i in range(150))
-        token = signing.dumps({'task': 1, 'id': 'task-1', 'duration': 1200}, salt='writing-task-timer')
-        request = self.post({'task_number': 1, 'response': words, 'task_token': token})
-        request.META['HTTP_X_USER_ID'] = 'user-1'
-        connections = []
-        for _ in range(3):
-            connection = MagicMock()
-            connection.__enter__.return_value = connection
-            cursor = MagicMock()
-            cursor.__enter__.return_value = cursor
-            connection.cursor.return_value = cursor
-            connections.append(connection)
-        response_cursor = connections[1].cursor.return_value.__enter__.return_value
-        response_cursor.fetchall.return_value = [('task-1', 1, 'Describe the chart.')]
-        response_cursor.description = [
-            SimpleNamespace(name='id'), SimpleNamespace(name='task_number'),
-            SimpleNamespace(name='prompt_text'),
-        ]
-        response_cursor.fetchone.side_effect = [None, ('response-1',)]
-        saved = sample_evaluation()
-        saved.update({'response_id': 'db-response', 'overall_band_score': 7.0, 'status': 'submitted'})
-        with patch('writing_service.views._connection', side_effect=connections), \
-                patch('writing_service.views.load_saved_evaluation', return_value=None), \
-                patch('writing_service.views._table', side_effect=['writing_tasks', 'writing_responses']), \
-                patch('writing_service.views._columns', side_effect=[
-                    {'id', 'task_number', 'prompt_text'},
-                    {'id', 'task_id', 'user_id', 'response_text', 'word_count'},
-                ]), \
-                patch('writing_service.views._column_types', return_value={}), \
-                patch('writing_service.views.evaluate_response', return_value=sample_evaluation()), \
-                patch('writing_service.views.persist_evaluation', return_value=saved) as persist:
+        request = self.post({'task_number': 1, 'response': words, 'task_token': 'invalid'})
+        with patch('writing_service.views._connection') as connection, patch('writing_service.views.evaluate_response') as evaluate:
             result = views.submit_response(request)
+        self.assertEqual(result.status_code, 403)
+        connection.assert_not_called()
+        evaluate.assert_not_called()
 
-        self.assertEqual(result.status_code, 201)
-        data = json.loads(result.content)
-        self.assertEqual(data['overall_band_score'], 7.0)
-        self.assertEqual(data['response_id'], 'db-response')
-        self.assertEqual(data['task_achievement']['feedback'], 'Compare the key figures.')
-        persist.assert_called_once()
+    def test_task_image_matches_test_id_and_real_extension(self):
+        self.assertEqual(views._task_image(1), 'test1.jpg')
+        self.assertEqual(views._task_image(5), 'test5.png')
+        self.assertEqual(views._task_image(13), 'test13.png')
+        self.assertIsNone(views._task_image('not-an-id'))
+        self.assertIsNone(views._task_image(999))
+
+    def test_random_task_uses_task_specific_table_and_returns_test_id(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(1, 'Describe chart A'), (5, 'Describe chart B')]
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch('writing_service.views._connection', return_value=conn), \
+                patch('writing_service.views._columns', return_value={'test_id', 'task_text'}), \
+                patch('writing_service.views.random.choice', return_value=(5, 'Describe chart B')):
+            result = views.task_detail(self.factory.get('/api/tasks/1/?seen=1'), 1)
+        body = json.loads(result.content)
+        self.assertEqual(body['test_id'], 5)
+        self.assertEqual(body['task_text'], 'Describe chart B')
+        self.assertEqual(body['image_url'], '/api/writing/task-images/test5.png/')
+        self.assertEqual(body['task_number'], 1)
+
+    def test_combined_band_weights_task_two_twice_and_rounds_to_half(self):
+        cursor = MagicMock()
+        cursor.fetchone.side_effect = [(6.0,), (7.0,)]
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch('writing_service.views._connection', return_value=conn), \
+                patch('writing_service.views._columns', return_value={'score_id', 'overall_band_score'}):
+            result = views.combined_score(self.factory.get('/api/scores/combined/'))
+        body = json.loads(result.content)
+        self.assertEqual(body['combined_writing_band'], 6.5)
+        self.assertEqual(body['task1_band'], 6.0)
+        self.assertEqual(body['task2_band'], 7.0)
 
 
 if __name__ == '__main__':

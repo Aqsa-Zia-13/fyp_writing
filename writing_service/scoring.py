@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MODEL_ID = 'gemini-3.5-flash-lite'
+MODEL_ID = os.environ.get('GEMINI_MODEL', 'gemini-3.5-flash-lite')
 CRITERIA = (
     'task_achievement',
     'coherence_cohesion',

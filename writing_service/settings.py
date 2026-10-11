@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 env_file = Path(__file__).resolve().parents[2] / 'fyp_root' / '.env'
-if not os.environ.get('DATABASE_URL') and env_file.exists():
+if env_file.exists():
     for line in env_file.read_text().splitlines():
         if line and not line.startswith('#') and '=' in line:
             key, value = line.split('=', 1)

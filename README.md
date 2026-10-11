@@ -1,23 +1,31 @@
 # Writing service
 
-The frontend calls the writing API through `fyp_root`; it never connects to this service directly.
+The browser calls `fyp_root`; the gateway applies its writing throttle and forwards the request to this service. Writing access is temporarily public for development. The gateway forwards a browser-local development user ID so scores remain separate per browser; authenticated user IDs can replace it when authentication is restored.
 
 ## Run locally
-
-Use the project's existing Python environment and the Supabase `DATABASE_URL` from `fyp_root/.env`.
 
 1. From `fyp_writing`, run `..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8002`.
 2. From `fyp_root`, run `..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000`.
 3. From `fyp_frontend`, run `npm run dev`.
 
-The service reads prompts from `wr_writing_tasks`, `writing_tasks`, or `writing_task`. Task tables should expose a task label (`task_number`, `task_type`, or `id`) and a prompt (`prompt_text` or `prompt`). Prompt selection is randomized and avoids prompt IDs already seen in the browser until a new cycle. Task 1 images are served from `data/` through the `fyp_root` gateway. If no response table exists, the service creates `writing_responses` on the first submission; an existing `writing_responses` or `writing_response` table is reused when it has an `id`/`response_id` and a response text column. Optional response columns `task_id`, `user_id`, and `word_count` are populated when present.
+Configure `DATABASE_URL`, `DJANGO_SECRET_KEY`, `INTERNAL_SERVICE_TOKEN`, and `GEMINI_API_KEY` in the backend environment or `fyp_root/.env`. `GEMINI_MODEL` is optional and defaults to `gemini-3.5-flash-lite`. Keep all keys on the backend; do not add them to Vite variables. The service loads missing environment values from `fyp_root/.env`.
 
-Task 1 is timed for 20 minutes and Task 2 for 40 minutes. The API enforces a non-empty response of 150–250 words before inserting it.
+## Task and image data
 
-## IELTS writing evaluation
+Prompts are selected randomly from `writing_task1` and `writing_task2`. Each table must expose a prompt identifier (`test_id` or `id`) and task text (`task_text`, `prompt_text`, `task_prompt`, `prompt`, or `description`). The live Supabase prompt tables currently contain `id`, `test_number`, and `prompt`; their 20 rows have matching `id` and `test_number` values, so `id` serves as the selected prompt's `test_id`. The selected identifier and exact prompt text are signed into a short-lived task token and rechecked at submission. The response is saved to `writing_response1` or `writing_response2`; its score and complete evaluation JSON are saved separately to `writing_score1` or `writing_score2`. The service creates response and score tables when absent and adds missing compatible columns to existing tables without deleting rows. It does not create or alter the source prompt tables.
 
-Valid submissions are evaluated on the backend with Gemini 3.5 Flash-Lite (`gemini-3.5-flash-lite`). Set `GEMINI_API_KEY` in the environment available to `fyp_writing` (or the shared `fyp_root/.env` loaded by its settings). The frontend sends submissions and retrieves task images through `fyp_root`; it never receives the Gemini key.
+Task 1 images are resolved as `data/test{test_id}.{extension}`. The service checks the actual `.jpg`, `.jpeg`, `.png`, and `.webp` files and returns no image when one is missing. Image requests also pass through `fyp_root`.
 
-The writing service creates `writing_scores` when it is absent. If a compatible `writing_scores` or `writing_score` table already exists, it reuses recognized response, task, user, criterion, overall-score, and evaluation columns, adding only missing score fields and a unique submission key. Scores are idempotent for repeated identical submissions. The API returns the evaluation read back from PostgreSQL. If Gemini is unavailable, the response text remains saved and the API returns a retryable service error.
+## Scoring and score views
 
-Run the offline scoring and API unit tests from `fyp_writing` with `..\.venv\Scripts\python.exe -m unittest writing_service.tests`.
+Gemini receives the exact selected task text and submitted response. The existing evaluation prompt, four criterion keys, and validation rules are retained. Backend code calculates each task band from the four criteria, and returns the evaluation read back from the task-specific score table. Task 1 and Task 2 score views fetch saved results. The combined band uses `(Task 1 + 2 × Task 2) / 3`, rounded to the nearest half band with ties rounded up.
+
+## Verification
+
+Run the offline checks from `fyp_writing`:
+
+```powershell
+..\.venv\Scripts\python.exe -m unittest writing_service.tests
+```
+
+Live Supabase and Gemini checks require outbound network access and valid project credentials. Do not treat offline tests as evidence that live integration is available.
