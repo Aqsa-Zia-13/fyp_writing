@@ -1,6 +1,6 @@
 # Writing service
 
-The browser calls `fyp_root`; the gateway applies its writing throttle and forwards the request to this service. Writing access is temporarily public for development. The gateway forwards a browser-local development user ID so scores remain separate per browser; authenticated user IDs can replace it when authentication is restored.
+The browser calls `fyp_root`; the gateway requires an authenticated account, applies its writing throttle, and forwards the verified user ID with the shared internal service token. The Writing service rejects requests without that token and user identity. Responses and scores are stored with that user's ID and score reads are owner-scoped.
 
 ## Run locally
 
@@ -8,11 +8,13 @@ The browser calls `fyp_root`; the gateway applies its writing throttle and forwa
 2. From `fyp_root`, run `..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000`.
 3. From `fyp_frontend`, run `npm run dev`.
 
-Configure `DATABASE_URL`, `DJANGO_SECRET_KEY`, `INTERNAL_SERVICE_TOKEN`, and `GEMINI_API_KEY` in the backend environment or `fyp_root/.env`. `GEMINI_MODEL` is optional and defaults to `gemini-3.5-flash-lite`. Keep all keys on the backend; do not add them to Vite variables. The service loads missing environment values from `fyp_root/.env`.
+Configure the same `DATABASE_URL` and `INTERNAL_SERVICE_TOKEN` for `fyp_root` and `fyp_writing`, plus `DJANGO_SECRET_KEY` for `fyp_root` and `GEMINI_API_KEY` for `fyp_writing`, in the backend environment or `fyp_root/.env`. `GEMINI_MODEL` is optional and defaults to `gemini-3.5-flash-lite`. Keep all keys on the backend; do not add them to Vite variables. The service loads missing environment values from `fyp_root/.env`.
 
 ## Task and image data
 
-Prompts are selected randomly from `writing_task1` and `writing_task2`. Each table must expose a prompt identifier (`test_id` or `id`) and task text (`task_text`, `prompt_text`, `task_prompt`, `prompt`, or `description`). The live Supabase prompt tables currently contain `id`, `test_number`, and `prompt`; their 20 rows have matching `id` and `test_number` values, so `id` serves as the selected prompt's `test_id`. The selected identifier and exact prompt text are signed into a short-lived task token and rechecked at submission. The response is saved to `writing_response1` or `writing_response2`; its score and complete evaluation JSON are saved separately to `writing_score1` or `writing_score2`. The service creates response and score tables when absent and adds missing compatible columns to existing tables without deleting rows. It does not create or alter the source prompt tables.
+Tests are listed from the existing `writing_task1` and `writing_task2` prompt tables and displayed as Test N. Each table must expose a prompt identifier (`test_id` or `id`), a test number (or numeric identifier), and task text (`task_text`, `prompt_text`, `task_prompt`, `prompt`, or `description`). The selected test and exact prompt text are signed into a short-lived task token bound to the authenticated user and rechecked at submission. The response is saved to `writing_response1` or `writing_response2`; its score and complete evaluation JSON are saved separately to `writing_score1` or `writing_score2`. The service creates response and score tables when absent and adds missing compatible columns to existing tables without deleting rows. It does not create or alter the source prompt tables.
+
+For database-side protection, run `sql/writing_rls.sql` in Supabase. It enables and forces RLS on the two prompt tables and all four response/score tables. The service switches each user request to PostgreSQL's non-bypass `authenticated` role and sets transaction-local `request.jwt.claim.sub` from the identity verified and forwarded by `fyp_root`. Policies use `auth.uid()` for owner checks, with restrictive identity guards to prevent broader permissive policies from exposing records. Runtime requests only validate the migrated schema; they do not run DDL under the `authenticated` role.
 
 Task 1 images are resolved as `data/test{test_id}.{extension}`. The service checks the actual `.jpg`, `.jpeg`, `.png`, and `.webp` files and returns no image when one is missing. Image requests also pass through `fyp_root`.
 
@@ -28,4 +30,10 @@ Run the offline checks from `fyp_writing`:
 ..\.venv\Scripts\python.exe -m unittest writing_service.tests
 ```
 
-Live Supabase and Gemini checks require outbound network access and valid project credentials. Do not treat offline tests as evidence that live integration is available.
+Run the root authentication and gateway checks from `fyp_root`:
+
+```powershell
+..\.venv\Scripts\python.exe manage.py test accounts.tests --settings=root_service.settings_test
+```
+
+Live Supabase and Gemini checks require outbound network access and valid project credentials. Offline tests do not verify email delivery, live Supabase RLS, or Gemini availability.

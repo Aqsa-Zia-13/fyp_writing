@@ -1,8 +1,12 @@
 """Writing task API. All frontend traffic reaches this service through fyp_root."""
 import json
+import hmac
+import logging
 import os
 import random
 import re
+import uuid
+from functools import wraps
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,15 +20,26 @@ from django.views.decorators.http import require_GET, require_POST
 
 from .scoring import CRITERIA, ScoringError, calculate_overall_band_score, evaluate_response
 
+logger = logging.getLogger(__name__)
 
-def _connection():
+
+def _connection(user_id=None):
     database_url = os.environ.get('DATABASE_URL')
     if not database_url:
         raise RuntimeError('DATABASE_URL is not configured for fyp_writing.')
     parsed = urlparse(database_url)
-    return psycopg.connect(host=parsed.hostname, port=parsed.port or 5432,
+    conn = psycopg.connect(host=parsed.hostname, port=parsed.port or 5432,
                            dbname=parsed.path.lstrip('/'), user=parsed.username,
                            password=parsed.password, sslmode='require', connect_timeout=5)
+    if user_id:
+        subject = str(uuid.UUID(str(user_id)))
+        conn.execute('SET LOCAL ROLE authenticated')
+        claims = json.dumps({'sub': subject, 'role': 'authenticated'})
+        conn.execute("SELECT set_config('request.jwt.claim.sub', %s, true)", (subject,))
+        conn.execute("SELECT set_config('request.jwt.claim.role', %s, true)", ('authenticated',))
+        conn.execute("SELECT set_config('request.jwt.claims', %s, true)", (claims,))
+        conn.execute("SELECT set_config('app.user_id', %s, true)", (subject,))
+    return conn
 
 
 def _columns(cursor, table):
@@ -43,6 +58,25 @@ def _first(columns, names):
 
 def _error(message, status=400):
     return JsonResponse({'detail': message}, status=status)
+
+
+def require_gateway_identity(view):
+    """Accept traffic only from fyp_root with its authenticated user identity."""
+    @wraps(view)
+    def wrapped(request, *args, **kwargs):
+        expected = os.environ.get('INTERNAL_SERVICE_TOKEN', '')
+        supplied = request.headers.get('X-Internal-Token', '')
+        user_id = request.headers.get('X-User-Id', '')
+        if not expected:
+            return _error('Writing service internal authentication is not configured.', 503)
+        try:
+            uuid.UUID(user_id)
+        except (ValueError, TypeError, AttributeError):
+            return _error('Authentication is required.', 401)
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return _error('Authentication is required.', 401)
+        return view(request, *args, **kwargs)
+    return wrapped
 
 
 def _db_error():
@@ -69,30 +103,74 @@ def _table_for_task(task_number):
     return f'writing_task{task_number}'
 
 
+@require_gateway_identity
+@require_GET
+def available_tests(request):
+    """Return the distinct tests available in the existing prompt tables."""
+    tests = {}
+    try:
+        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
+            for task_number in (1, 2):
+                table = _table_for_task(task_number)
+                columns = _columns(cursor, table)
+                identifier, prompt = _prompt_fields(columns)
+                if not identifier or not prompt:
+                    continue
+                number_column = 'test_number' if 'test_number' in columns else identifier
+                cursor.execute(sql.SQL('SELECT {id}, {number} FROM {table} WHERE {prompt} IS NOT NULL').format(
+                    id=sql.Identifier(identifier), number=sql.Identifier(number_column),
+                    table=sql.Identifier(table), prompt=sql.Identifier(prompt)))
+                for test_id, test_number in cursor.fetchall():
+                    try:
+                        number = int(test_number)
+                    except (TypeError, ValueError):
+                        continue
+                    item = tests.setdefault(number, {'test_number': number, 'task1': False, 'task2': False})
+                    item[f'task{task_number}'] = True
+        return JsonResponse({'tests': [tests[number] for number in sorted(tests)]})
+    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError):
+        return _db_error()
+
+
+@require_gateway_identity
 @require_GET
 def task_detail(request, task_number):
     if task_number not in (1, 2):
         return _error('Task number must be 1 or 2.')
     try:
-        with _connection() as conn, conn.cursor() as cursor:
+        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
             table = _table_for_task(task_number)
             columns = _columns(cursor, table)
             identifier, prompt = _prompt_fields(columns)
             if not identifier or not prompt:
                 return _error(f'{table} must contain a prompt ID and a task text column.', 503)
-            cursor.execute(sql.SQL('SELECT {id}, {prompt} FROM {table} WHERE {prompt} IS NOT NULL').format(
-                id=sql.Identifier(identifier), prompt=sql.Identifier(prompt), table=sql.Identifier(table)))
-            rows = cursor.fetchall()
-            if not rows:
-                return _error('No prompt was found for this writing task.', 404)
-            seen = set(request.GET.getlist('seen'))
-            unseen = [row for row in rows if str(row[0]) not in seen]
-            test_id, task_text = random.choice(unseen or rows)
+            number_column = 'test_number' if 'test_number' in columns else identifier
+            requested_number = request.GET.get('test_number')
+            if requested_number is None:
+                cursor.execute(sql.SQL('SELECT {id}, {prompt}, {number} FROM {table} WHERE {prompt} IS NOT NULL').format(
+                    id=sql.Identifier(identifier), prompt=sql.Identifier(prompt), number=sql.Identifier(number_column), table=sql.Identifier(table)))
+                rows = cursor.fetchall()
+                if not rows:
+                    return _error('No prompt was found for this writing task.', 404)
+                seen = set(request.GET.getlist('seen'))
+                unseen = [row for row in rows if str(row[0]) not in seen]
+                test_id, task_text, test_number = random.choice(unseen or rows)
+            else:
+                try:
+                    test_number = int(requested_number)
+                except ValueError:
+                    return _error('The selected test is invalid.')
+                cursor.execute(sql.SQL('SELECT {id}, {prompt}, {number} FROM {table} WHERE {number}::text=%s AND {prompt} IS NOT NULL LIMIT 1').format(
+                    id=sql.Identifier(identifier), prompt=sql.Identifier(prompt), number=sql.Identifier(number_column), table=sql.Identifier(table)), (str(test_number),))
+                row = cursor.fetchone()
+                if not row:
+                    return _error('The selected writing test is unavailable for this task.', 404)
+                test_id, task_text, test_number = row
             duration = 1200 if task_number == 1 else 2400
-            token = signing.dumps({'task_number': task_number, 'test_id': str(test_id), 'task_text': task_text, 'duration': duration}, salt='writing-task-session')
-            image = _task_image(test_id) if task_number == 1 else None
+            token = signing.dumps({'task_number': task_number, 'test_id': str(test_id), 'test_number': str(test_number), 'task_text': task_text, 'user_id': request.headers['X-User-Id'], 'duration': duration}, salt='writing-task-session')
+            image = _task_image(test_number) if task_number == 1 else None
             return JsonResponse({'task_number': task_number, 'task_type': f'task{task_number}',
-                                 'test_id': test_id, 'task_text': task_text, 'prompt': task_text,
+                                 'test_id': test_id, 'test_number': test_number, 'task_text': task_text, 'prompt': task_text,
                                  'prompt_id': str(test_id),
                                  'image_url': f'/api/writing/task-images/{image}/' if image else None,
                                  'duration_seconds': duration, 'task_token': token})
@@ -100,6 +178,7 @@ def task_detail(request, task_number):
         return _db_error()
 
 
+@require_gateway_identity
 @require_GET
 def task_image(request, filename):
     if not re.fullmatch(r'test\d+\.(?:jpg|jpeg|png|webp)', filename):
@@ -115,36 +194,27 @@ def task_image(request, filename):
 
 def _ensure_response_table(cursor, task_number):
     table = f'writing_response{task_number}'
-    if not _columns(cursor, table):
-        cursor.execute(sql.SQL('CREATE TABLE {} (response_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), test_id text NOT NULL, task_type text NOT NULL, response_text text NOT NULL, word_count integer NOT NULL, user_id text, created_at timestamptz NOT NULL DEFAULT now())').format(sql.Identifier(table)))
     columns = _columns(cursor, table)
-    for name, definition in (('test_id', 'text'), ('task_type', 'text'), ('response_text', 'text'), ('word_count', 'integer'), ('user_id', 'text'), ('created_at', 'timestamptz')):
-        if name not in columns:
-            if name == 'created_at':
-                definition = 'timestamptz NOT NULL DEFAULT now()'
-            cursor.execute(sql.SQL('ALTER TABLE {} ADD COLUMN {} {}').format(sql.Identifier(table), sql.Identifier(name), sql.SQL(definition)))
-    cursor.execute(sql.SQL('ALTER TABLE {} ALTER COLUMN created_at SET DEFAULT now()').format(sql.Identifier(table)))
+    required = {'response_id', 'test_id', 'task_type', 'response_text', 'word_count', 'user_id', 'created_at'}
+    if not required.issubset(columns):
+        raise RuntimeError(f'{table} is missing required migrated columns.')
     return table
 
 
 def _ensure_score_table(cursor, task_number):
     table = f'writing_score{task_number}'
-    if not _columns(cursor, table):
-        cursor.execute(sql.SQL('CREATE TABLE {} (score_id uuid PRIMARY KEY DEFAULT gen_random_uuid(), response_id text NOT NULL, test_id text NOT NULL, task_type text NOT NULL, task_achievement numeric(3,1) NOT NULL, coherence_cohesion numeric(3,1) NOT NULL, lexical_resource numeric(3,1) NOT NULL, grammar_accuracy numeric(3,1) NOT NULL, overall_band_score numeric(3,1) NOT NULL, evaluation_json jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now())').format(sql.Identifier(table)))
     columns = _columns(cursor, table)
-    definitions = {'response_id': 'text', 'test_id': 'text', 'task_type': 'text',
-                   'task_achievement': 'numeric(3,1)', 'coherence_cohesion': 'numeric(3,1)',
-                   'lexical_resource': 'numeric(3,1)', 'grammar_accuracy': 'numeric(3,1)',
-                   'overall_band_score': 'numeric(3,1)', 'evaluation_json': 'jsonb', 'user_id': 'text', 'created_at': 'timestamptz'}
-    for name, definition in definitions.items():
-        if name not in columns:
-            if name == 'created_at':
-                definition = 'timestamptz NOT NULL DEFAULT now()'
-            cursor.execute(sql.SQL('ALTER TABLE {} ADD COLUMN {} {}').format(sql.Identifier(table), sql.Identifier(name), sql.SQL(definition)))
-    cursor.execute(sql.SQL('ALTER TABLE {} ALTER COLUMN created_at SET DEFAULT now()').format(sql.Identifier(table)))
+    required = {
+        'score_id', 'response_id', 'test_id', 'task_type', 'task_achievement',
+        'coherence_cohesion', 'lexical_resource', 'grammar_accuracy',
+        'overall_band_score', 'evaluation_json', 'user_id', 'created_at',
+    }
+    if not required.issubset(columns):
+        raise RuntimeError(f'{table} is missing required migrated columns.')
     return table
 
 
+@require_gateway_identity
 @csrf_exempt
 @require_POST
 def submit_response(request):
@@ -172,16 +242,17 @@ def submit_response(request):
     try:
         duration = 20 * 60 if task_number == 1 else 40 * 60
         session = signing.loads(token, salt='writing-task-session', max_age=duration)
-        if session.get('task_number') != task_number or not session.get('test_id'):
+        if (session.get('task_number') != task_number or not session.get('test_id')
+                or session.get('user_id') != request.headers['X-User-Id']):
             return _error('The writing task session is invalid. Please reload the task.', 403)
     except signing.SignatureExpired:
         return _error('You are out of time. The task cannot be submitted now.', 422)
     except (signing.BadSignature, signing.SignatureExpired, TypeError):
         return _error('The writing task session is invalid. Please reload the task.', 403)
 
-    user_id = request.headers.get('X-User-Id')
+    user_id = request.headers['X-User-Id']
     try:
-        with _connection() as conn, conn.cursor() as cursor:
+        with _connection(user_id) as conn, conn.cursor() as cursor:
             task_table = _table_for_task(task_number)
             task_columns = _columns(cursor, task_table)
             id_column, prompt_column = _prompt_fields(task_columns)
@@ -198,6 +269,8 @@ def submit_response(request):
             response_table = _ensure_response_table(cursor, task_number)
             response_columns = _columns(cursor, response_table)
             response_types = _types(cursor, response_table)
+            if 'user_id' not in response_columns:
+                return _error('Saved response table does not support user ownership.', 503)
             response_id_col = _first(response_columns, ('response_id', 'id'))
             text_col = _first(response_columns, ('response_text', 'response', 'answer', 'content'))
             test_col = _first(response_columns, ('test_id', 'task_id', 'writing_task_id'))
@@ -222,9 +295,11 @@ def submit_response(request):
             response_id = str(cursor.fetchone()[0])
         evaluation = evaluate_response(task_number, task_text, response)
         band = calculate_overall_band_score([evaluation[key]['score'] for key in CRITERIA])
-        with _connection() as conn, conn.cursor() as cursor:
+        with _connection(user_id) as conn, conn.cursor() as cursor:
             table = _ensure_score_table(cursor, task_number)
             columns = _columns(cursor, table)
+            if 'user_id' not in columns:
+                return _error('Saved score table does not support user ownership.', 503)
             id_col = _first(columns, ('score_id', 'id'))
             response_col = _first(columns, ('response_id', 'writing_response_id'))
             if not id_col or not response_col:
@@ -275,17 +350,19 @@ def submit_response(request):
         return JsonResponse(details, status=201)
     except ScoringError as error:
         return _error(str(error), 503)
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError, KeyError, IndexError):
+    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError, KeyError, IndexError) as error:
+        logger.error('Writing request failed: error_type=%s sqlstate=%s', type(error).__name__, getattr(error, 'sqlstate', None))
         return _db_error()
 
 
+@require_gateway_identity
 @require_GET
 def score_detail(request, task_number):
     if task_number not in (1, 2):
         return _error('Task number must be 1 or 2.')
     response_id = request.GET.get('response_id')
     try:
-        with _connection() as conn, conn.cursor() as cursor:
+        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
             table = _ensure_score_table(cursor, task_number)
             columns = _columns(cursor, table)
             id_col = _first(columns, ('score_id', 'id'))
@@ -300,9 +377,11 @@ def score_detail(request, task_number):
                 where = sql.SQL('TRUE')
                 params = []
             user_id = request.headers.get('X-User-Id')
-            if user_id and 'user_id' in columns:
+            if 'user_id' in columns:
                 where += sql.SQL(' AND user_id::text=%s')
                 params.append(user_id)
+            else:
+                return _error('Saved score table does not support user ownership.', 503)
             cursor.execute(sql.SQL('SELECT {details},{band} FROM {table} WHERE {where} ORDER BY {id} DESC LIMIT 1').format(
                 details=sql.Identifier(details_col), band=sql.Identifier(_first(columns, ('overall_band_score', 'overall_score', 'overall_band'))),
                 table=sql.Identifier(table), where=where, id=sql.Identifier(id_col)), params)
@@ -316,11 +395,12 @@ def score_detail(request, task_number):
         return _db_error()
 
 
+@require_gateway_identity
 @require_GET
 def combined_score(request):
     result = {}
     try:
-        with _connection() as conn, conn.cursor() as cursor:
+        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
             for number in (1, 2):
                 table = f'writing_score{number}'
                 columns = _columns(cursor, table)
@@ -329,12 +409,11 @@ def combined_score(request):
                 if not band_col or not id_col:
                     return _error(f'No saved Task {number} score was found.', 404)
                 user_id = request.headers.get('X-User-Id')
-                if user_id and 'user_id' in columns:
+                if 'user_id' in columns:
                     cursor.execute(sql.SQL('SELECT {band} FROM {table} WHERE user_id::text=%s ORDER BY {id} DESC LIMIT 1').format(
                         band=sql.Identifier(band_col), table=sql.Identifier(table), id=sql.Identifier(id_col)), (user_id,))
                 else:
-                    cursor.execute(sql.SQL('SELECT {band} FROM {table} ORDER BY {id} DESC LIMIT 1').format(
-                        band=sql.Identifier(band_col), table=sql.Identifier(table), id=sql.Identifier(id_col)))
+                    return _error('Saved score table does not support user ownership.', 503)
                 row = cursor.fetchone()
                 if not row:
                     return _error(f'No saved Task {number} score was found.', 404)
