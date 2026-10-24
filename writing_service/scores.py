@@ -1,4 +1,9 @@
-"""PostgreSQL persistence for idempotent IELTS writing evaluations."""
+"""Legacy raw-SQL score helper retained for compatibility tests only.
+
+The API no longer imports this module: it contains dynamic schema discovery and
+DDL for an older score-table shape, which is unsuitable for the current managed
+Supabase schema and RLS-bound request path. Production persistence uses models.
+"""
 
 import json
 from datetime import datetime, timezone

@@ -1,59 +1,29 @@
 """Writing task API. All frontend traffic reaches this service through fyp_root."""
-import json
 import hmac
+import json
 import logging
 import os
 import random
 import re
 import uuid
-from functools import wraps
 from decimal import Decimal, ROUND_HALF_UP
+from functools import wraps
 from pathlib import Path
-from urllib.parse import urlparse
 
-import psycopg
-from psycopg import sql
 from django.core import signing
+from django.db import DatabaseError
 from django.http import FileResponse, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
+from .database import user_database_context
+from .models import WritingResponse1, WritingResponse2, WritingScore1, WritingScore2, WritingTask1, WritingTask2
 from .scoring import CRITERIA, ScoringError, calculate_overall_band_score, evaluate_response
 
 logger = logging.getLogger(__name__)
-
-
-def _connection(user_id=None):
-    database_url = os.environ.get('DATABASE_URL')
-    if not database_url:
-        raise RuntimeError('DATABASE_URL is not configured for fyp_writing.')
-    parsed = urlparse(database_url)
-    conn = psycopg.connect(host=parsed.hostname, port=parsed.port or 5432,
-                           dbname=parsed.path.lstrip('/'), user=parsed.username,
-                           password=parsed.password, sslmode='require', connect_timeout=5)
-    if user_id:
-        subject = str(uuid.UUID(str(user_id)))
-        conn.execute('SET LOCAL ROLE authenticated')
-        claims = json.dumps({'sub': subject, 'role': 'authenticated'})
-        conn.execute("SELECT set_config('request.jwt.claim.sub', %s, true)", (subject,))
-        conn.execute("SELECT set_config('request.jwt.claim.role', %s, true)", ('authenticated',))
-        conn.execute("SELECT set_config('request.jwt.claims', %s, true)", (claims,))
-        conn.execute("SELECT set_config('app.user_id', %s, true)", (subject,))
-    return conn
-
-
-def _columns(cursor, table):
-    cursor.execute('SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s', (table,))
-    return {row[0] for row in cursor.fetchall()}
-
-
-def _types(cursor, table):
-    cursor.execute('SELECT column_name,data_type,udt_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s', (table,))
-    return {name: (data, udt) for name, data, udt in cursor.fetchall()}
-
-
-def _first(columns, names):
-    return next((name for name in names if name in columns), None)
+TASK_MODELS = {1: WritingTask1, 2: WritingTask2}
+RESPONSE_MODELS = {1: WritingResponse1, 2: WritingResponse2}
+SCORE_MODELS = {1: WritingScore1, 2: WritingScore2}
 
 
 def _error(message, status=400):
@@ -83,10 +53,6 @@ def _db_error():
     return _error('Writing database is unavailable or its tables are not configured.', 503)
 
 
-def _prompt_fields(columns):
-    return (_first(columns, ('test_id', 'id')), _first(columns, ('task_text', 'prompt_text', 'task_prompt', 'prompt', 'description')))
-
-
 def _task_image(test_id):
     """Find the actual bundled extension for a testN image."""
     if isinstance(test_id, bool) or not str(test_id).isdigit():
@@ -99,28 +65,16 @@ def _task_image(test_id):
     return None
 
 
-def _table_for_task(task_number):
-    return f'writing_task{task_number}'
-
-
 @require_gateway_identity
 @require_GET
 def available_tests(request):
     """Return the distinct tests available in the existing prompt tables."""
     tests = {}
     try:
-        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
-            for task_number in (1, 2):
-                table = _table_for_task(task_number)
-                columns = _columns(cursor, table)
-                identifier, prompt = _prompt_fields(columns)
-                if not identifier or not prompt:
-                    continue
-                number_column = 'test_number' if 'test_number' in columns else identifier
-                cursor.execute(sql.SQL('SELECT {id}, {number} FROM {table} WHERE {prompt} IS NOT NULL').format(
-                    id=sql.Identifier(identifier), number=sql.Identifier(number_column),
-                    table=sql.Identifier(table), prompt=sql.Identifier(prompt)))
-                for test_id, test_number in cursor.fetchall():
+        with user_database_context(request.headers['X-User-Id']):
+            for task_number, model in TASK_MODELS.items():
+                rows = model.objects.filter(prompt__isnull=False).values_list('id', 'test_number')
+                for test_id, test_number in rows:
                     try:
                         number = int(test_number)
                     except (TypeError, ValueError):
@@ -128,7 +82,7 @@ def available_tests(request):
                     item = tests.setdefault(number, {'test_number': number, 'task1': False, 'task2': False})
                     item[f'task{task_number}'] = True
         return JsonResponse({'tests': [tests[number] for number in sorted(tests)]})
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError):
+    except (DatabaseError, RuntimeError, OSError, ValueError, TypeError):
         return _db_error()
 
 
@@ -138,18 +92,12 @@ def task_detail(request, task_number):
     if task_number not in (1, 2):
         return _error('Task number must be 1 or 2.')
     try:
-        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
-            table = _table_for_task(task_number)
-            columns = _columns(cursor, table)
-            identifier, prompt = _prompt_fields(columns)
-            if not identifier or not prompt:
-                return _error(f'{table} must contain a prompt ID and a task text column.', 503)
-            number_column = 'test_number' if 'test_number' in columns else identifier
+        model = TASK_MODELS[task_number]
+        with user_database_context(request.headers['X-User-Id']):
+            queryset = model.objects.filter(prompt__isnull=False)
             requested_number = request.GET.get('test_number')
             if requested_number is None:
-                cursor.execute(sql.SQL('SELECT {id}, {prompt}, {number} FROM {table} WHERE {prompt} IS NOT NULL').format(
-                    id=sql.Identifier(identifier), prompt=sql.Identifier(prompt), number=sql.Identifier(number_column), table=sql.Identifier(table)))
-                rows = cursor.fetchall()
+                rows = list(queryset.values_list('id', 'prompt', 'test_number'))
                 if not rows:
                     return _error('No prompt was found for this writing task.', 404)
                 seen = set(request.GET.getlist('seen'))
@@ -160,21 +108,24 @@ def task_detail(request, task_number):
                     test_number = int(requested_number)
                 except ValueError:
                     return _error('The selected test is invalid.')
-                cursor.execute(sql.SQL('SELECT {id}, {prompt}, {number} FROM {table} WHERE {number}::text=%s AND {prompt} IS NOT NULL LIMIT 1').format(
-                    id=sql.Identifier(identifier), prompt=sql.Identifier(prompt), number=sql.Identifier(number_column), table=sql.Identifier(table)), (str(test_number),))
-                row = cursor.fetchone()
+                row = queryset.filter(test_number=test_number).values_list('id', 'prompt', 'test_number').first()
                 if not row:
                     return _error('The selected writing test is unavailable for this task.', 404)
                 test_id, task_text, test_number = row
             duration = 1200 if task_number == 1 else 2400
-            token = signing.dumps({'task_number': task_number, 'test_id': str(test_id), 'test_number': str(test_number), 'task_text': task_text, 'user_id': request.headers['X-User-Id'], 'duration': duration}, salt='writing-task-session')
+            token = signing.dumps({
+                'task_number': task_number, 'test_id': str(test_id), 'test_number': str(test_number),
+                'task_text': task_text, 'user_id': request.headers['X-User-Id'], 'duration': duration,
+            }, salt='writing-task-session')
             image = _task_image(test_number) if task_number == 1 else None
-            return JsonResponse({'task_number': task_number, 'task_type': f'task{task_number}',
-                                 'test_id': test_id, 'test_number': test_number, 'task_text': task_text, 'prompt': task_text,
-                                 'prompt_id': str(test_id),
-                                 'image_url': f'/api/writing/task-images/{image}/' if image else None,
-                                 'duration_seconds': duration, 'task_token': token})
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError):
+            return JsonResponse({
+                'task_number': task_number, 'task_type': f'task{task_number}',
+                'test_id': test_id, 'test_number': test_number, 'task_text': task_text,
+                'prompt': task_text, 'prompt_id': str(test_id),
+                'image_url': f'/api/writing/task-images/{image}/' if image else None,
+                'duration_seconds': duration, 'task_token': token,
+            })
+    except (DatabaseError, RuntimeError, OSError, ValueError, TypeError):
         return _db_error()
 
 
@@ -192,28 +143,6 @@ def task_image(request, filename):
         return _error('Task image was not found.', 404)
 
 
-def _ensure_response_table(cursor, task_number):
-    table = f'writing_response{task_number}'
-    columns = _columns(cursor, table)
-    required = {'response_id', 'test_id', 'task_type', 'response_text', 'word_count', 'user_id', 'created_at'}
-    if not required.issubset(columns):
-        raise RuntimeError(f'{table} is missing required migrated columns.')
-    return table
-
-
-def _ensure_score_table(cursor, task_number):
-    table = f'writing_score{task_number}'
-    columns = _columns(cursor, table)
-    required = {
-        'score_id', 'response_id', 'test_id', 'task_type', 'task_achievement',
-        'coherence_cohesion', 'lexical_resource', 'grammar_accuracy',
-        'overall_band_score', 'evaluation_json', 'user_id', 'created_at',
-    }
-    if not required.issubset(columns):
-        raise RuntimeError(f'{table} is missing required migrated columns.')
-    return table
-
-
 @require_gateway_identity
 @csrf_exempt
 @require_POST
@@ -228,13 +157,13 @@ def submit_response(request):
         task_number = int(payload.get('task_number'))
     except (ValueError, TypeError):
         task_number = 0
-    response = payload.get('response')
+    response_text = payload.get('response')
     token = payload.get('task_token')
     if task_number not in (1, 2):
         return _error('task_number must be 1 or 2.')
-    if not isinstance(response, str) or not response.strip():
+    if not isinstance(response_text, str) or not response_text.strip():
         return _error('Response cannot be empty.')
-    word_count = len(response.split())
+    word_count = len(response_text.split())
     if word_count < 150:
         return _error('Response cannot be less than 150 words.', 422)
     if word_count > 250:
@@ -247,111 +176,47 @@ def submit_response(request):
             return _error('The writing task session is invalid. Please reload the task.', 403)
     except signing.SignatureExpired:
         return _error('You are out of time. The task cannot be submitted now.', 422)
-    except (signing.BadSignature, signing.SignatureExpired, TypeError):
+    except (signing.BadSignature, TypeError):
         return _error('The writing task session is invalid. Please reload the task.', 403)
 
     user_id = request.headers['X-User-Id']
     try:
-        with _connection(user_id) as conn, conn.cursor() as cursor:
-            task_table = _table_for_task(task_number)
-            task_columns = _columns(cursor, task_table)
-            id_column, prompt_column = _prompt_fields(task_columns)
-            if not id_column or not prompt_column:
-                return _error(f'{task_table} must contain a prompt ID and a task text column.', 503)
-            cursor.execute(sql.SQL('SELECT {prompt} FROM {table} WHERE {id}::text=%s').format(
-                prompt=sql.Identifier(prompt_column), table=sql.Identifier(task_table), id=sql.Identifier(id_column)), (str(session['test_id']),))
-            row = cursor.fetchone()
-            if not row:
+        task_model = TASK_MODELS[task_number]
+        response_model = RESPONSE_MODELS[task_number]
+        score_model = SCORE_MODELS[task_number]
+        with user_database_context(user_id):
+            task_text = task_model.objects.filter(pk=session['test_id']).values_list('prompt', flat=True).first()
+            if task_text is None:
                 return _error('The selected writing prompt no longer exists.', 404)
-            task_text = row[0]
             if task_text != session.get('task_text'):
                 return _error('The writing task session no longer matches its prompt.', 403)
-            response_table = _ensure_response_table(cursor, task_number)
-            response_columns = _columns(cursor, response_table)
-            response_types = _types(cursor, response_table)
-            if 'user_id' not in response_columns:
-                return _error('Saved response table does not support user ownership.', 503)
-            response_id_col = _first(response_columns, ('response_id', 'id'))
-            text_col = _first(response_columns, ('response_text', 'response', 'answer', 'content'))
-            test_col = _first(response_columns, ('test_id', 'task_id', 'writing_task_id'))
-            task_type_col = _first(response_columns, ('task_type', 'task_number'))
-            words_col = _first(response_columns, ('word_count',))
-            if not response_id_col or not text_col:
-                return _error(f'{response_table} needs a response_id and response_text column.', 503)
-            mapped = {text_col: response}
-            for column in ('test_id', 'task_id', 'writing_task_id'):
-                if column in response_columns:
-                    mapped[column] = str(session['test_id'])
-            for column in ('task_type', 'task_number'):
-                if column in response_columns:
-                    mapped[column] = f'task{task_number}' if column == 'task_type' else task_number
-            for column in ('word_count', 'user_id', 'student_id'):
-                if column in response_columns and (column == 'word_count' or user_id is not None):
-                    mapped[column] = word_count if column == 'word_count' else user_id
-            cursor.execute(sql.SQL('INSERT INTO {table} ({cols}) VALUES ({vals}) RETURNING {id}').format(
-                table=sql.Identifier(response_table), cols=sql.SQL(',').join(map(sql.Identifier, mapped)),
-                vals=sql.SQL(',').join(sql.SQL('%s::uuid') if response_types.get(c, ('',''))[1] == 'uuid' else sql.Placeholder() for c in mapped),
-                id=sql.Identifier(response_id_col)), list(mapped.values()))
-            response_id = str(cursor.fetchone()[0])
-        evaluation = evaluate_response(task_number, task_text, response)
+            saved_response = response_model.objects.create(
+                test_id=str(session['test_id']), task_type=f'task{task_number}',
+                response_text=response_text, word_count=word_count, user_id=user_id,
+            )
+            response_id = str(saved_response.response_id)
+
+        evaluation = evaluate_response(task_number, task_text, response_text)
         band = calculate_overall_band_score([evaluation[key]['score'] for key in CRITERIA])
-        with _connection(user_id) as conn, conn.cursor() as cursor:
-            table = _ensure_score_table(cursor, task_number)
-            columns = _columns(cursor, table)
-            if 'user_id' not in columns:
-                return _error('Saved score table does not support user ownership.', 503)
-            id_col = _first(columns, ('score_id', 'id'))
-            response_col = _first(columns, ('response_id', 'writing_response_id'))
-            if not id_col or not response_col:
-                return _error(f'{table} needs score_id and response_id columns.', 503)
-            record = {'response_id': response_id, 'test_id': str(session['test_id']), 'task_type': f'task{task_number}',
-                      **{key: evaluation[key]['score'] for key in CRITERIA}, 'overall_band_score': band,
-                      'evaluation_json': json.dumps(evaluation, ensure_ascii=False), 'user_id': user_id}
-            mapped = {key: value for key, value in record.items() if key in columns}
-            for column in ('writing_response_id', 'submission_id'):
-                if column in columns:
-                    mapped[column] = response_id
-            for column in ('task_id', 'writing_task_id'):
-                if column in columns:
-                    mapped[column] = str(session['test_id'])
-            for column in ('task_number',):
-                if column in columns:
-                    mapped[column] = task_number
-            for column in ('task_achievement_score', 'coherence_cohesion_score', 'lexical_resource_score', 'grammar_accuracy_score'):
-                criterion = column[:-6]
-                if column in columns:
-                    mapped[column] = evaluation[criterion]['score']
-            for column in ('overall_score', 'overall_band'):
-                if column in columns:
-                    mapped[column] = band
-            for column in ('evaluation', 'llm_evaluation', 'score_details', 'feedback_json'):
-                if column in columns:
-                    mapped[column] = json.dumps(evaluation, ensure_ascii=False)
-            if not any(k in mapped for k in ('evaluation_json', 'evaluation', 'score_details')):
-                return _error(f'{table} needs an evaluation_json column to preserve reasoning and feedback.', 503)
-            score_types = _types(cursor, table)
-            cursor.execute(sql.SQL('INSERT INTO {table} ({cols}) VALUES ({vals}) RETURNING {id}').format(
-                table=sql.Identifier(table), cols=sql.SQL(',').join(map(sql.Identifier, mapped)),
-                vals=sql.SQL(',').join(sql.SQL('%s::json') if score_types.get(k, ('',''))[0] == 'json' else sql.SQL('%s::jsonb') if score_types.get(k, ('',''))[0] == 'jsonb' else sql.SQL('%s::uuid') if score_types.get(k, ('',''))[1] == 'uuid' else sql.Placeholder() for k in mapped),
-                id=sql.Identifier(id_col)), list(mapped.values()))
-            score_id = str(cursor.fetchone()[0])
-            cursor.execute(sql.SQL('SELECT {cols} FROM {table} WHERE {id}=%s').format(
-                cols=sql.SQL(',').join(map(sql.Identifier, mapped)), table=sql.Identifier(table), id=sql.Identifier(id_col)), (score_id,))
-            saved = dict(zip((d.name for d in cursor.description), cursor.fetchone()))
-            details_col = _first(saved.keys(), ('evaluation_json', 'evaluation', 'score_details'))
-            details = saved[details_col]
-            if isinstance(details, str):
-                details = json.loads(details)
-            details['overall_band_score'] = float(saved.get('overall_band_score', band))
-            details['response_id'] = response_id
-            details['test_id'] = str(session['test_id'])
-            details['task_number'] = task_number
-            details['status'] = 'submitted'
+        with user_database_context(user_id):
+            saved_score = score_model.objects.create(
+                response_id=response_id, test_id=str(session['test_id']), task_type=f'task{task_number}',
+                task_achievement=evaluation['task_achievement']['score'],
+                coherence_cohesion=evaluation['coherence_cohesion']['score'],
+                lexical_resource=evaluation['lexical_resource']['score'],
+                grammar_accuracy=evaluation['grammar_accuracy']['score'],
+                overall_band_score=band, evaluation_json=evaluation, user_id=user_id,
+            )
+            details = dict(saved_score.evaluation_json)
+            details.update({
+                'overall_band_score': float(saved_score.overall_band_score), 'response_id': response_id,
+                'test_id': str(session['test_id']), 'task_number': task_number, 'status': 'submitted',
+            })
         return JsonResponse(details, status=201)
     except ScoringError as error:
         return _error(str(error), 503)
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError, KeyError, IndexError) as error:
-        logger.error('Writing request failed: error_type=%s sqlstate=%s', type(error).__name__, getattr(error, 'sqlstate', None))
+    except (DatabaseError, RuntimeError, OSError, ValueError, TypeError, KeyError, IndexError) as error:
+        logger.error('Writing request failed: error_type=%s', type(error).__name__)
         return _db_error()
 
 
@@ -360,38 +225,20 @@ def submit_response(request):
 def score_detail(request, task_number):
     if task_number not in (1, 2):
         return _error('Task number must be 1 or 2.')
-    response_id = request.GET.get('response_id')
     try:
-        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
-            table = _ensure_score_table(cursor, task_number)
-            columns = _columns(cursor, table)
-            id_col = _first(columns, ('score_id', 'id'))
-            response_col = _first(columns, ('response_id', 'writing_response_id'))
-            details_col = _first(columns, ('evaluation_json', 'evaluation', 'score_details'))
-            if not (id_col and response_col and details_col):
-                return _error('Saved score table is incomplete.', 503)
+        score_model = SCORE_MODELS[task_number]
+        with user_database_context(request.headers['X-User-Id']):
+            queryset = score_model.objects.filter(user_id=request.headers['X-User-Id'])
+            response_id = request.GET.get('response_id')
             if response_id:
-                where = sql.SQL('{response}::text=%s').format(response=sql.Identifier(response_col))
-                params = [response_id]
-            else:
-                where = sql.SQL('TRUE')
-                params = []
-            user_id = request.headers.get('X-User-Id')
-            if 'user_id' in columns:
-                where += sql.SQL(' AND user_id::text=%s')
-                params.append(user_id)
-            else:
-                return _error('Saved score table does not support user ownership.', 503)
-            cursor.execute(sql.SQL('SELECT {details},{band} FROM {table} WHERE {where} ORDER BY {id} DESC LIMIT 1').format(
-                details=sql.Identifier(details_col), band=sql.Identifier(_first(columns, ('overall_band_score', 'overall_score', 'overall_band'))),
-                table=sql.Identifier(table), where=where, id=sql.Identifier(id_col)), params)
-            row = cursor.fetchone()
-            if not row:
+                queryset = queryset.filter(response_id=response_id)
+            saved = queryset.order_by('-score_id').first()
+            if not saved:
                 return _error('No saved score was found for this task.', 404)
-            details = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-            details['overall_band_score'] = float(row[1])
+            details = dict(saved.evaluation_json)
+            details['overall_band_score'] = float(saved.overall_band_score)
             return JsonResponse(details)
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError, KeyError):
+    except (DatabaseError, RuntimeError, OSError, ValueError, TypeError):
         return _db_error()
 
 
@@ -400,26 +247,16 @@ def score_detail(request, task_number):
 def combined_score(request):
     result = {}
     try:
-        with _connection(request.headers['X-User-Id']) as conn, conn.cursor() as cursor:
-            for number in (1, 2):
-                table = f'writing_score{number}'
-                columns = _columns(cursor, table)
-                band_col = _first(columns, ('overall_band_score', 'overall_score', 'overall_band'))
-                id_col = _first(columns, ('score_id', 'id'))
-                if not band_col or not id_col:
+        user_id = request.headers['X-User-Id']
+        with user_database_context(user_id):
+            for number, model in SCORE_MODELS.items():
+                band = model.objects.filter(user_id=user_id).order_by('-score_id').values_list(
+                    'overall_band_score', flat=True).first()
+                if band is None:
                     return _error(f'No saved Task {number} score was found.', 404)
-                user_id = request.headers.get('X-User-Id')
-                if 'user_id' in columns:
-                    cursor.execute(sql.SQL('SELECT {band} FROM {table} WHERE user_id::text=%s ORDER BY {id} DESC LIMIT 1').format(
-                        band=sql.Identifier(band_col), table=sql.Identifier(table), id=sql.Identifier(id_col)), (user_id,))
-                else:
-                    return _error('Saved score table does not support user ownership.', 503)
-                row = cursor.fetchone()
-                if not row:
-                    return _error(f'No saved Task {number} score was found.', 404)
-                result[f'task{number}_band'] = float(row[0])
+                result[f'task{number}_band'] = float(band)
         weighted = (Decimal(str(result['task1_band'])) + 2 * Decimal(str(result['task2_band']))) / 3
         result['combined_writing_band'] = float((weighted * 2).quantize(Decimal('1'), rounding=ROUND_HALF_UP) / 2)
         return JsonResponse(result)
-    except (psycopg.Error, RuntimeError, OSError, ValueError, TypeError):
+    except (DatabaseError, RuntimeError, OSError, ValueError, TypeError):
         return _db_error()

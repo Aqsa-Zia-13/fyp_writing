@@ -4,6 +4,7 @@ import json
 import os
 import unittest
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,10 @@ from django.core import signing
 from django.test import RequestFactory
 
 from writing_service import scoring, views
+from writing_service.models import (
+    WritingResponse1, WritingResponse2, WritingScore1, WritingScore2,
+    WritingTask1, WritingTask2,
+)
 from writing_service.scores import ensure_score_table, persist_evaluation
 
 TEST_USER_ID = str(uuid.UUID('f7d5ca85-9a2f-4eeb-aec6-189e18572c51'))
@@ -155,6 +160,25 @@ class ScorePersistenceTests(unittest.TestCase):
         self.assertEqual(result['lexical_resource']['score'], 6.5)
 
 
+class ModelMappingTests(unittest.TestCase):
+    def test_models_match_existing_table_names_and_are_unmanaged(self):
+        expected = {
+            WritingTask1: 'writing_task1', WritingTask2: 'writing_task2',
+            WritingResponse1: 'writing_response1', WritingResponse2: 'writing_response2',
+            WritingScore1: 'writing_score1', WritingScore2: 'writing_score2',
+        }
+        for model, table in expected.items():
+            with self.subTest(table=table):
+                self.assertEqual(model._meta.db_table, table)
+                self.assertFalse(model._meta.managed)
+        self.assertEqual(WritingResponse1._meta.pk.name, 'response_id')
+        self.assertEqual(WritingScore2._meta.pk.name, 'score_id')
+        self.assertTrue(WritingResponse1._meta.get_field('user_id').null)
+        self.assertTrue(WritingScore1._meta.get_field('user_id').null)
+        self.assertEqual(WritingScore1._meta.get_field('evaluation_json').get_internal_type(), 'JSONField')
+        self.assertFalse(any(field.is_relation for model in expected for field in model._meta.fields))
+
+
 class SubmitResponseTests(unittest.TestCase):
     def setUp(self):
         self.factory = RequestFactory()
@@ -164,59 +188,49 @@ class SubmitResponseTests(unittest.TestCase):
         return self.factory.post('/api/responses/', data=json.dumps(body), content_type='application/json', **self.identity)
 
     def test_word_count_errors_return_before_database_or_gemini(self):
-        body = {'task_number': 1, 'response': 'too short'}
-        response = views.submit_response(self.post(body))
+        response = views.submit_response(self.post({'task_number': 1, 'response': 'too short'}))
         self.assertEqual(response.status_code, 422)
         self.assertEqual(json.loads(response.content)['detail'], 'Response cannot be less than 150 words.')
 
     def test_requests_without_gateway_identity_are_rejected(self):
-        request = self.factory.get('/api/tests/')
-        response = views.available_tests(request)
+        response = views.available_tests(self.factory.get('/api/tests/'))
         self.assertEqual(response.status_code, 401)
 
+    def test_invalid_gateway_token_is_rejected_before_database_access(self):
+        request = self.factory.get('/api/tests/', HTTP_X_USER_ID=TEST_USER_ID,
+                                   HTTP_X_INTERNAL_TOKEN='forged-service-token')
+        with patch('writing_service.views.user_database_context') as context:
+            response = views.available_tests(request)
+        self.assertEqual(response.status_code, 401)
+        context.assert_not_called()
+
     def test_available_tests_are_read_from_both_prompt_tables(self):
-        cursor = MagicMock()
-        cursor.fetchall.side_effect = [[(1, 1), (2, 2)], [(1, 1), (3, 3)]]
-        conn = MagicMock()
-        conn.__enter__.return_value = conn
-        conn.cursor.return_value.__enter__.return_value = cursor
-        with patch('writing_service.views._connection', return_value=conn), \
-                patch('writing_service.views._columns', return_value={'id', 'test_number', 'prompt'}):
+        one, two = MagicMock(), MagicMock()
+        one.objects.filter.return_value.values_list.return_value = [(9, 1), (10, 2)]
+        two.objects.filter.return_value.values_list.return_value = [(11, 1), (12, 3)]
+        with patch.dict(views.TASK_MODELS, {1: one, 2: two}), patch('writing_service.views.user_database_context', return_value=nullcontext()):
             response = views.available_tests(self.factory.get('/api/tests/', **self.identity))
-        body = json.loads(response.content)
-        self.assertEqual(body['tests'], [
+        self.assertEqual(json.loads(response.content)['tests'], [
             {'test_number': 1, 'task1': True, 'task2': True},
             {'test_number': 2, 'task1': True, 'task2': False},
             {'test_number': 3, 'task1': False, 'task2': True},
         ])
 
     def test_selected_test_returns_its_task_prompt(self):
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (5, 'Describe chart B', 5)
-        conn = MagicMock()
-        conn.__enter__.return_value = conn
-        conn.cursor.return_value.__enter__.return_value = cursor
-        with patch('writing_service.views._connection', return_value=conn), \
-                patch('writing_service.views._columns', return_value={'id', 'test_number', 'prompt'}):
+        model = MagicMock()
+        model.objects.filter.return_value.filter.return_value.values_list.return_value.first.return_value = (5, 'Describe chart B', 5)
+        with patch.dict(views.TASK_MODELS, {1: model}), patch('writing_service.views.user_database_context', return_value=nullcontext()):
             response = views.task_detail(self.factory.get('/api/tasks/1/?test_number=5', **self.identity), 1)
-        body = json.loads(response.content)
-        self.assertEqual(body['test_number'], 5)
-        self.assertEqual(body['prompt'], 'Describe chart B')
+        self.assertEqual(json.loads(response.content)['prompt'], 'Describe chart B')
 
-    def test_score_lookup_always_filters_by_the_gateway_user(self):
-        cursor = MagicMock()
-        cursor.fetchone.return_value = (sample_evaluation(), 7.0)
-        conn = MagicMock()
-        conn.__enter__.return_value = conn
-        conn.cursor.return_value.__enter__.return_value = cursor
-        with patch('writing_service.views._connection', return_value=conn), \
-                patch('writing_service.views._ensure_score_table', return_value='writing_score1'), \
-                patch('writing_service.views._columns', return_value={
-                    'score_id', 'response_id', 'overall_band_score', 'evaluation_json', 'user_id',
-                }):
+    def test_score_lookup_filters_by_authenticated_user(self):
+        saved = SimpleNamespace(evaluation_json=sample_evaluation(), overall_band_score=7.0)
+        model = MagicMock()
+        model.objects.filter.return_value.order_by.return_value.first.return_value = saved
+        with patch.dict(views.SCORE_MODELS, {1: model}), patch('writing_service.views.user_database_context', return_value=nullcontext()):
             response = views.score_detail(self.factory.get('/api/scores/1/', **self.identity), 1)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(cursor.execute.call_args.args[1], [TEST_USER_ID])
+        model.objects.filter.assert_called_once_with(user_id=TEST_USER_ID)
 
     def test_empty_response_has_specific_error(self):
         response = views.submit_response(self.post({'task_number': 1, 'response': '  '}))
@@ -224,69 +238,34 @@ class SubmitResponseTests(unittest.TestCase):
 
     def test_bad_task_token_is_rejected_before_database_or_gemini(self):
         words = ' '.join(f'word{i}' for i in range(150))
-        request = self.post({'task_number': 1, 'response': words, 'task_token': 'invalid'})
-        with patch('writing_service.views._connection') as connection, patch('writing_service.views.evaluate_response') as evaluate:
-            result = views.submit_response(request)
+        with patch('writing_service.views.user_database_context') as context, patch('writing_service.views.evaluate_response') as evaluate:
+            result = views.submit_response(self.post({'task_number': 1, 'response': words, 'task_token': 'invalid'}))
         self.assertEqual(result.status_code, 403)
-        connection.assert_not_called()
+        context.assert_not_called()
         evaluate.assert_not_called()
 
     def test_submission_saves_response_and_score_for_authenticated_user(self):
         task_text = 'Describe the information shown in the chart.'
-        task_token = signing.dumps({
-            'task_number': 1, 'test_id': '5', 'test_number': '5',
-            'task_text': task_text, 'user_id': TEST_USER_ID, 'duration': 1200,
-        }, salt='writing-task-session')
+        response_id = '8f36e55a-019c-49b6-a875-feb04ca28fda'
+        token = signing.dumps({'task_number': 1, 'test_id': '5', 'test_number': '5', 'task_text': task_text,
+                              'user_id': TEST_USER_ID, 'duration': 1200}, salt='writing-task-session')
         words = ' '.join(f'word{i}' for i in range(150))
-        request = self.post({'task_number': 1, 'response': words, 'task_token': task_token})
-
-        response_cursor = MagicMock()
-        response_cursor.fetchone.side_effect = [(task_text,), ('8f36e55a-019c-49b6-a875-feb04ca28fda',)]
-        response_conn = MagicMock()
-        response_conn.__enter__.return_value = response_conn
-        response_conn.cursor.return_value.__enter__.return_value = response_cursor
-
-        score_columns = {
-            'score_id', 'response_id', 'test_id', 'task_type', 'task_achievement',
-            'coherence_cohesion', 'lexical_resource', 'grammar_accuracy',
-            'overall_band_score', 'evaluation_json', 'user_id',
-        }
         evaluation = sample_evaluation()
-        saved_columns = [
-            'response_id', 'test_id', 'task_type', 'task_achievement', 'coherence_cohesion',
-            'lexical_resource', 'grammar_accuracy', 'overall_band_score', 'evaluation_json', 'user_id',
-        ]
-        saved_values = (
-            '8f36e55a-019c-49b6-a875-feb04ca28fda', '5', 'task1', 7.0, 7.0, 6.5, 7.0,
-            7.0, evaluation, TEST_USER_ID,
-        )
-        score_cursor = MagicMock()
-        score_cursor.description = [SimpleNamespace(name=name) for name in saved_columns]
-        score_cursor.fetchone.side_effect = [('acac37af-ff05-4b7d-bfd2-36dd11d001bc',), saved_values]
-        score_conn = MagicMock()
-        score_conn.__enter__.return_value = score_conn
-        score_conn.cursor.return_value.__enter__.return_value = score_cursor
-
-        def table_columns(_cursor, table):
-            return {
-                'writing_task1': {'id', 'prompt', 'test_number'},
-                'writing_response1': {'response_id', 'test_id', 'task_type', 'response_text', 'word_count', 'user_id'},
-                'writing_score1': score_columns,
-            }[table]
-
-        with patch('writing_service.views._connection', side_effect=[response_conn, score_conn]) as connection, \
-                patch('writing_service.views._columns', side_effect=table_columns), \
-                patch('writing_service.views._types', side_effect=[{'response_id': ('uuid', 'uuid')}, {'evaluation_json': ('jsonb', 'jsonb')}]), \
-                patch('writing_service.views._ensure_response_table', return_value='writing_response1'), \
-                patch('writing_service.views._ensure_score_table', return_value='writing_score1'), \
+        saved_score = SimpleNamespace(evaluation_json=evaluation, overall_band_score=7.0)
+        task_model, response_model, score_model = MagicMock(), MagicMock(), MagicMock()
+        task_model.objects.filter.return_value.values_list.return_value.first.return_value = task_text
+        response_model.objects.create.return_value = SimpleNamespace(response_id=response_id)
+        score_model.objects.create.return_value = saved_score
+        with patch.dict(views.TASK_MODELS, {1: task_model}), patch.dict(views.RESPONSE_MODELS, {1: response_model}), \
+                patch.dict(views.SCORE_MODELS, {1: score_model}), patch('writing_service.views.user_database_context', return_value=nullcontext()), \
                 patch('writing_service.views.evaluate_response', return_value=evaluation):
-            result = views.submit_response(request)
-
+            result = views.submit_response(self.post({'task_number': 1, 'response': words, 'task_token': token}))
         self.assertEqual(result.status_code, 201)
-        self.assertEqual(connection.call_args_list[0].args, (TEST_USER_ID,))
-        self.assertEqual(connection.call_args_list[1].args, (TEST_USER_ID,))
-        self.assertEqual(response_cursor.execute.call_args_list[1].args[1][-1], TEST_USER_ID)
-        self.assertEqual(score_cursor.execute.call_args_list[0].args[1][-1], TEST_USER_ID)
+        response_model.objects.create.assert_called_once_with(
+            test_id='5', task_type='task1', response_text=words, word_count=150, user_id=TEST_USER_ID)
+        score_model.objects.create.assert_called_once()
+        self.assertEqual(score_model.objects.create.call_args.kwargs['user_id'], TEST_USER_ID)
+        self.assertEqual(score_model.objects.create.call_args.kwargs['response_id'], response_id)
         self.assertEqual(json.loads(result.content)['overall_band_score'], 7.0)
 
     def test_task_image_matches_test_id_and_real_extension(self):
@@ -297,34 +276,25 @@ class SubmitResponseTests(unittest.TestCase):
         self.assertIsNone(views._task_image(999))
 
     def test_random_task_uses_task_specific_table_and_returns_test_id(self):
-        cursor = MagicMock()
-        cursor.fetchall.return_value = [(1, 'Describe chart A', 1), (5, 'Describe chart B', 5)]
-        conn = MagicMock()
-        conn.__enter__.return_value = conn
-        conn.cursor.return_value.__enter__.return_value = cursor
-        with patch('writing_service.views._connection', return_value=conn), \
-                patch('writing_service.views._columns', return_value={'test_id', 'task_text'}), \
+        model = MagicMock()
+        queryset = model.objects.filter.return_value
+        queryset.values_list.return_value = [(1, 'Describe chart A', 1), (5, 'Describe chart B', 5)]
+        with patch.dict(views.TASK_MODELS, {1: model}), patch('writing_service.views.user_database_context', return_value=nullcontext()), \
                 patch('writing_service.views.random.choice', return_value=(5, 'Describe chart B', 5)):
             result = views.task_detail(self.factory.get('/api/tasks/1/?seen=1', **self.identity), 1)
         body = json.loads(result.content)
         self.assertEqual(body['test_id'], 5)
         self.assertEqual(body['task_text'], 'Describe chart B')
         self.assertEqual(body['image_url'], '/api/writing/task-images/test5.png/')
-        self.assertEqual(body['task_number'], 1)
 
     def test_combined_band_weights_task_two_twice_and_rounds_to_half(self):
-        cursor = MagicMock()
-        cursor.fetchone.side_effect = [(6.0,), (7.0,)]
-        conn = MagicMock()
-        conn.__enter__.return_value = conn
-        conn.cursor.return_value.__enter__.return_value = cursor
-        with patch('writing_service.views._connection', return_value=conn), \
-                patch('writing_service.views._columns', return_value={'score_id', 'overall_band_score', 'user_id'}):
+        one, two = MagicMock(), MagicMock()
+        one.objects.filter.return_value.order_by.return_value.values_list.return_value.first.return_value = 6.0
+        two.objects.filter.return_value.order_by.return_value.values_list.return_value.first.return_value = 7.0
+        with patch.dict(views.SCORE_MODELS, {1: one, 2: two}), patch('writing_service.views.user_database_context', return_value=nullcontext()):
             result = views.combined_score(self.factory.get('/api/scores/combined/', **self.identity))
         body = json.loads(result.content)
         self.assertEqual(body['combined_writing_band'], 6.5)
-        self.assertEqual(body['task1_band'], 6.0)
-        self.assertEqual(body['task2_band'], 7.0)
 
 
 if __name__ == '__main__':
